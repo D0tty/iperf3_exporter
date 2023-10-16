@@ -44,6 +44,14 @@ var (
 	// Metrics about the iperf3 exporter itself.
 	iperfDuration = prometheus.NewSummary(prometheus.SummaryOpts{Name: prometheus.BuildFQName(namespace, "exporter", "duration_seconds"), Help: "Duration of collections by the iperf3 exporter."})
 	iperfErrors   = prometheus.NewCounter(prometheus.CounterOpts{Name: prometheus.BuildFQName(namespace, "exporter", "errors_total"), Help: "Errors raised by the iperf3 exporter."})
+
+	cacheTime                     = time.Hour * time.Duration(1)
+	lastExport                    = time.Now().AddDate(0, 0, -1)
+	cachedThread                  = 0
+	cachedSentSeconds     float64 = 0
+	cachedSentBytes       float64 = 0
+	cachedReceivedSeconds float64 = 0
+	cachedReceivedBytes   float64 = 0
 )
 
 // iperfResult collects the partial result from the iperf3 run
@@ -64,13 +72,13 @@ type iperfResult struct {
 // the prometheus metrics package.
 type Exporter struct {
 	target  string
-        port	int
-        thread  int
+	port    int
+	thread  int
 	period  time.Duration
 	timeout time.Duration
 	mutex   sync.RWMutex
 
-        nbThread        *prometheus.Desc
+	nbThread        *prometheus.Desc
 	success         *prometheus.Desc
 	sentSeconds     *prometheus.Desc
 	sentBytes       *prometheus.Desc
@@ -82,8 +90,8 @@ type Exporter struct {
 func NewExporter(target string, port int, thread int, period time.Duration, timeout time.Duration) *Exporter {
 	return &Exporter{
 		target:          target,
-                port:            port,
-                thread:          thread,
+		port:            port,
+		thread:          thread,
 		period:          period,
 		timeout:         timeout,
 		nbThread:        prometheus.NewDesc(prometheus.BuildFQName(namespace, "", "nb_thread"), "Total number of thread used by the client.", nil, nil),
@@ -98,7 +106,7 @@ func NewExporter(target string, port int, thread int, period time.Duration, time
 // Describe describes all the metrics exported by the iperf3 exporter. It
 // implements prometheus.Collector.
 func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
-        ch <- e.nbThread
+	ch <- e.nbThread
 	ch <- e.success
 	ch <- e.sentSeconds
 	ch <- e.sentBytes
@@ -115,34 +123,45 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 	defer cancel()
 
-        var iperfArgs []string
-        iperfArgs = append(iperfArgs, "-J", "-t", strconv.FormatFloat(e.period.Seconds(), 'f', 0, 64), "-c", e.target, "-p", strconv.Itoa(e.port))
+	if time.Now().Sub(lastExport) >= cacheTime {
 
-        iperfArgs = append(iperfArgs, "-P", strconv.Itoa(e.thread))
+		var iperfArgs []string
+		iperfArgs = append(iperfArgs, "-J", "-t", strconv.FormatFloat(e.period.Seconds(), 'f', 0, 64), "-c", e.target, "-p", strconv.Itoa(e.port))
 
-        out, err := exec.CommandContext(ctx, iperfCmd, iperfArgs...).Output()
+		iperfArgs = append(iperfArgs, "-P", strconv.Itoa(e.thread))
 
-        if err != nil {
-		ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
-		iperfErrors.Inc()
-		log.Errorf("Failed to run iperf3: %s", err)
-		return
+		out, err := exec.CommandContext(ctx, iperfCmd, iperfArgs...).Output()
+
+		if err != nil {
+			ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
+			iperfErrors.Inc()
+			log.Errorf("Failed to run iperf3: %s", err)
+			return
+		}
+
+		stats := iperfResult{}
+		if err := json.Unmarshal(out, &stats); err != nil {
+			ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
+			iperfErrors.Inc()
+			log.Errorf("Failed to parse iperf3 result: %s", err)
+			return
+		}
+
+		cachedThread = e.thread
+		cachedSentSeconds = stats.End.SumSent.Seconds
+		cachedSentBytes = stats.End.SumSent.Bytes
+		cachedReceivedSeconds = stats.End.SumReceived.Seconds
+		cachedReceivedBytes = stats.End.SumReceived.Bytes
+
+		lastExport = time.Now()
 	}
 
-	stats := iperfResult{}
-	if err := json.Unmarshal(out, &stats); err != nil {
-		ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 0)
-		iperfErrors.Inc()
-		log.Errorf("Failed to parse iperf3 result: %s", err)
-		return
-	}
-
-	ch <- prometheus.MustNewConstMetric(e.nbThread, prometheus.GaugeValue, float64(e.thread))
+	ch <- prometheus.MustNewConstMetric(e.nbThread, prometheus.GaugeValue, float64(cachedThread))
 	ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 1)
-	ch <- prometheus.MustNewConstMetric(e.sentSeconds, prometheus.GaugeValue, stats.End.SumSent.Seconds)
-	ch <- prometheus.MustNewConstMetric(e.sentBytes, prometheus.GaugeValue, stats.End.SumSent.Bytes)
-	ch <- prometheus.MustNewConstMetric(e.receivedSeconds, prometheus.GaugeValue, stats.End.SumReceived.Seconds)
-	ch <- prometheus.MustNewConstMetric(e.receivedBytes, prometheus.GaugeValue, stats.End.SumReceived.Bytes)
+	ch <- prometheus.MustNewConstMetric(e.sentSeconds, prometheus.GaugeValue, cachedSentSeconds)
+	ch <- prometheus.MustNewConstMetric(e.sentBytes, prometheus.GaugeValue, cachedSentBytes)
+	ch <- prometheus.MustNewConstMetric(e.receivedSeconds, prometheus.GaugeValue, cachedReceivedSeconds)
+	ch <- prometheus.MustNewConstMetric(e.receivedBytes, prometheus.GaugeValue, cachedReceivedBytes)
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -153,35 +172,35 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-        var targetPort int
-        port := r.URL.Query().Get("port")
-        if port != "" {
-                var err error
-                targetPort, err = strconv.Atoi(port)
-                if err != nil {
-                        http.Error(w, fmt.Sprintf("'port' parameter must be an integer: %s", err), http.StatusBadRequest)
-                        iperfErrors.Inc()
-                        return
-                }
-        }
-        if targetPort == 0 {
-                targetPort = 5201
-        }
+	var targetPort int
+	port := r.URL.Query().Get("port")
+	if port != "" {
+		var err error
+		targetPort, err = strconv.Atoi(port)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'port' parameter must be an integer: %s", err), http.StatusBadRequest)
+			iperfErrors.Inc()
+			return
+		}
+	}
+	if targetPort == 0 {
+		targetPort = 5201
+	}
 
-        var targetThread int
-        thread := r.URL.Query().Get("thread")
-        if thread != "" {
-                var err error
-                targetThread, err = strconv.Atoi(thread)
-                if err != nil {
-                        http.Error(w, fmt.Sprintf("'thread' parameter must be an integer: %s", err), http.StatusBadRequest)
-                        iperfErrors.Inc()
-                        return
-                }
-        }
-        if targetThread <= 0 {
-                targetThread = 1
-        }
+	var targetThread int
+	thread := r.URL.Query().Get("thread")
+	if thread != "" {
+		var err error
+		targetThread, err = strconv.Atoi(thread)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("'thread' parameter must be an integer: %s", err), http.StatusBadRequest)
+			iperfErrors.Inc()
+			return
+		}
+	}
+	if targetThread <= 0 {
+		targetThread = 1
+	}
 
 	var runPeriod time.Duration
 	period := r.URL.Query().Get("period")
