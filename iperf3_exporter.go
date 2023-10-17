@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
@@ -36,6 +37,17 @@ const (
 	namespace = "iperf3"
 )
 
+func GetCacheTimeOrDefault() time.Duration {
+	strCache, ok := os.LookupEnv("CACHE_TIME")
+	if ok {
+		intCache, err := strconv.ParseInt(strCache, 10, 64)
+		if err == nil {
+			return time.Minute * time.Duration(intCache)
+		}
+	}
+	return time.Hour * time.Duration(1)
+}
+
 var (
 	listenAddress = kingpin.Flag("web.listen-address", "Address to listen on for web interface and telemetry.").Default(":9579").String()
 	metricsPath   = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
@@ -45,14 +57,40 @@ var (
 	iperfDuration = prometheus.NewSummary(prometheus.SummaryOpts{Name: prometheus.BuildFQName(namespace, "exporter", "duration_seconds"), Help: "Duration of collections by the iperf3 exporter."})
 	iperfErrors   = prometheus.NewCounter(prometheus.CounterOpts{Name: prometheus.BuildFQName(namespace, "exporter", "errors_total"), Help: "Errors raised by the iperf3 exporter."})
 
-	cacheTime                     = time.Hour * time.Duration(1)
-	lastExport                    = time.Now().AddDate(0, 0, -1)
-	cachedThread                  = 0
-	cachedSentSeconds     float64 = 0
-	cachedSentBytes       float64 = 0
-	cachedReceivedSeconds float64 = 0
-	cachedReceivedBytes   float64 = 0
+	cacheMap  = make(map[string]*CacheExporter)
+	cacheTime = GetCacheTimeOrDefault()
 )
+
+type CacheExporter struct {
+	lastExport            time.Time
+	cachedThread          int
+	cachedSentSeconds     float64
+	cachedSentBytes       float64
+	cachedReceivedSeconds float64
+	cachedReceivedBytes   float64
+}
+
+func NewCacheExporter(exportTime time.Time, thread int, sentSeconds float64, sentBytes float64, receivedSeconds float64, receivedBytes float64) *CacheExporter {
+	return &CacheExporter{
+		lastExport:            exportTime,
+		cachedThread:          thread,
+		cachedSentSeconds:     sentSeconds,
+		cachedSentBytes:       sentBytes,
+		cachedReceivedSeconds: receivedSeconds,
+		cachedReceivedBytes:   receivedBytes,
+	}
+}
+
+func NewExpiredCacheExporter() *CacheExporter {
+	return &CacheExporter{
+		lastExport:            time.Now().AddDate(-1, 0, 0), // create expired cache on purpose
+		cachedThread:          0,
+		cachedSentSeconds:     0,
+		cachedSentBytes:       0,
+		cachedReceivedSeconds: 0,
+		cachedReceivedBytes:   0,
+	}
+}
 
 // iperfResult collects the partial result from the iperf3 run
 type iperfResult struct {
@@ -123,7 +161,14 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), e.timeout)
 	defer cancel()
 
-	if time.Now().Sub(lastExport) >= cacheTime {
+	currentCacheExport, ok := cacheMap[e.target]
+
+	if !ok {
+		cacheMap[e.target] = NewExpiredCacheExporter()
+		currentCacheExport, ok = cacheMap[e.target]
+	}
+
+	if time.Now().Sub(currentCacheExport.lastExport) >= cacheTime {
 
 		var iperfArgs []string
 		iperfArgs = append(iperfArgs, "-J", "-t", strconv.FormatFloat(e.period.Seconds(), 'f', 0, 64), "-c", e.target, "-p", strconv.Itoa(e.port))
@@ -147,21 +192,21 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			return
 		}
 
-		cachedThread = e.thread
-		cachedSentSeconds = stats.End.SumSent.Seconds
-		cachedSentBytes = stats.End.SumSent.Bytes
-		cachedReceivedSeconds = stats.End.SumReceived.Seconds
-		cachedReceivedBytes = stats.End.SumReceived.Bytes
+		currentCacheExport.cachedThread = e.thread
+		currentCacheExport.cachedSentSeconds = stats.End.SumSent.Seconds
+		currentCacheExport.cachedSentBytes = stats.End.SumSent.Bytes
+		currentCacheExport.cachedReceivedSeconds = stats.End.SumReceived.Seconds
+		currentCacheExport.cachedReceivedBytes = stats.End.SumReceived.Bytes
+		currentCacheExport.lastExport = time.Now()
 
-		lastExport = time.Now()
 	}
 
-	ch <- prometheus.MustNewConstMetric(e.nbThread, prometheus.GaugeValue, float64(cachedThread))
+	ch <- prometheus.MustNewConstMetric(e.nbThread, prometheus.GaugeValue, float64(currentCacheExport.cachedThread))
 	ch <- prometheus.MustNewConstMetric(e.success, prometheus.GaugeValue, 1)
-	ch <- prometheus.MustNewConstMetric(e.sentSeconds, prometheus.GaugeValue, cachedSentSeconds)
-	ch <- prometheus.MustNewConstMetric(e.sentBytes, prometheus.GaugeValue, cachedSentBytes)
-	ch <- prometheus.MustNewConstMetric(e.receivedSeconds, prometheus.GaugeValue, cachedReceivedSeconds)
-	ch <- prometheus.MustNewConstMetric(e.receivedBytes, prometheus.GaugeValue, cachedReceivedBytes)
+	ch <- prometheus.MustNewConstMetric(e.sentSeconds, prometheus.GaugeValue, currentCacheExport.cachedSentSeconds)
+	ch <- prometheus.MustNewConstMetric(e.sentBytes, prometheus.GaugeValue, currentCacheExport.cachedSentBytes)
+	ch <- prometheus.MustNewConstMetric(e.receivedSeconds, prometheus.GaugeValue, currentCacheExport.cachedReceivedSeconds)
+	ch <- prometheus.MustNewConstMetric(e.receivedBytes, prometheus.GaugeValue, currentCacheExport.cachedReceivedBytes)
 }
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -291,6 +336,7 @@ func main() {
 		WriteTimeout: 60 * time.Second,
 	}
 
+	log.Infof("Caching enabled, duration: %s", cacheTime)
 	log.Infof("Listening on %s", srv.Addr)
 	log.Fatal(srv.ListenAndServe())
 }
